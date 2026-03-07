@@ -26,33 +26,88 @@ fn print_section(section: &ChangeSection) {
     println!("  {}", section.name.bold().underline());
     println!();
 
+    let mut added: Vec<(&str, Option<&str>)> = Vec::new();
+    let mut removed: Vec<(&str, Option<&str>)> = Vec::new();
+    let mut modified: Vec<(&str, &str)> = Vec::new();
+
     for entry in &section.entries {
         match entry {
-            ChangeEntry::Added(name, detail) => {
-                print!("    {} {}", "+".green().bold(), name.green());
-                if let Some(d) = detail {
-                    print!("  {}", d.dimmed());
-                }
-                println!();
-            }
-            ChangeEntry::Removed(name, detail) => {
-                print!("    {} {}", "-".red().bold(), name.red());
-                if let Some(d) = detail {
-                    print!("  {}", d.dimmed());
-                }
-                println!();
-            }
-            ChangeEntry::Modified(name, desc) => {
-                println!(
-                    "    {} {}  {}",
-                    "~".yellow().bold(),
-                    name.yellow(),
-                    desc.dimmed()
-                );
-            }
+            ChangeEntry::Added(n, d) => added.push((n, d.as_deref())),
+            ChangeEntry::Removed(n, d) => removed.push((n, d.as_deref())),
+            ChangeEntry::Modified(n, d) => modified.push((n, d)),
         }
     }
 
+    // Modified entries always span full width
+    for (name, desc) in &modified {
+        println!(
+            "    {} {}  {}",
+            "~".yellow().bold(),
+            name.yellow(),
+            desc.dimmed()
+        );
+    }
+
+    if !added.is_empty() && !removed.is_empty() {
+        print_two_columns(&added, &removed);
+    } else {
+        // Single column when only additions or only removals
+        for (name, detail) in &added {
+            print_single_entry("+", name, *detail, true);
+        }
+        for (name, detail) in &removed {
+            print_single_entry("-", name, *detail, false);
+        }
+    }
+
+    println!();
+}
+
+/// Print added and removed entries side by side.
+fn print_two_columns(added: &[(&str, Option<&str>)], removed: &[(&str, Option<&str>)]) {
+    // Compute right column start position from the widest left entry
+    let max_left = added
+        .iter()
+        .map(|(n, d)| 6 + n.len() + d.map_or(0, |d| 2 + d.len()))
+        .max()
+        .unwrap_or(0);
+    let right_col = (max_left + 4).clamp(28, 52);
+
+    let rows = added.len().max(removed.len());
+    for i in 0..rows {
+        let used = if i < added.len() {
+            print!("    {} {}", "+".green().bold(), added[i].0.green());
+            let mut w = 6 + added[i].0.len();
+            if let Some(d) = added[i].1 {
+                print!("  {}", d.dimmed());
+                w += 2 + d.len();
+            }
+            w
+        } else {
+            0
+        };
+
+        if i < removed.len() {
+            let pad = right_col.saturating_sub(used).max(2);
+            print!("{:w$}", "", w = pad);
+            print!("{} {}", "-".red().bold(), removed[i].0.red());
+            if let Some(d) = removed[i].1 {
+                print!("  {}", d.dimmed());
+            }
+        }
+        println!();
+    }
+}
+
+fn print_single_entry(symbol: &str, name: &str, detail: Option<&str>, is_add: bool) {
+    if is_add {
+        print!("    {} {}", symbol.green().bold(), name.green());
+    } else {
+        print!("    {} {}", symbol.red().bold(), name.red());
+    }
+    if let Some(d) = detail {
+        print!("  {}", d.dimmed());
+    }
     println!();
 }
 

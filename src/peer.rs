@@ -103,13 +103,13 @@ impl ProtocolHandler for ShareHandler {
 
         // Exchange: send ours, receive theirs
         send_msg(&mut send, &self.my_summary).await?;
-        send.finish()?;
         let peer_data = recv_msg(&mut recv).await?;
 
-        // Wait for the peer to close the connection (meaning it finished reading)
-        connection.closed().await;
+        // Signal completion: finish our stream, wait for peer to finish theirs.
+        // This confirms both sides received the other's data before we tear down.
+        send.finish()?;
+        recv.read_to_end(0).await.map_err(AcceptError::from_err)?;
 
-        // Only signal done after the peer has confirmed receipt
         if let Some(tx) = self.done.lock().await.take() {
             tx.send(peer_data).ok();
         }
@@ -137,11 +137,14 @@ pub async fn compare(my_summary: Vec<u8>, ticket_b64: &str) -> Result<Vec<u8>> {
     send_msg(&mut send, &my_summary)
         .await
         .map_err(|e| n0_error::anyerr!("send failed: {e}"))?;
-    send.finish().anyerr()?;
 
     let peer_data = recv_msg(&mut recv)
         .await
         .map_err(|e| n0_error::anyerr!("recv failed: {e}"))?;
+
+    // Signal completion: finish our stream, wait for peer to finish theirs.
+    send.finish().anyerr()?;
+    recv.read_to_end(0).await.anyerr()?;
 
     conn.close(0u32.into(), b"done");
     endpoint.close().await;
