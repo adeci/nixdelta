@@ -1,8 +1,11 @@
-//! Extract a SystemSummary from the currently running NixOS system.
+//! Extract a SystemSummary directly from the nix store.
 //!
-//! Reads exclusively from the nix store via `/run/current-system`. No root
-//! access needed, no runtime state queried — just the declarative artifacts
-//! that NixOS built.
+//! Reads system closures via their store-linked root paths — no nix evaluation,
+//! no root access, no runtime state. Just the declarative artifacts that NixOS
+//! built.
+//!
+//! Works with any system root: `/run/current-system`, generation profile links,
+//! or build results like `./result`.
 
 use crate::extract::{
     ExtractError, FirewallInfo, MachineInfo, PostgresqlInfo, ServiceInfo, SystemSummary, UserInfo,
@@ -17,12 +20,16 @@ const SYSTEM_ROOT: &str = "/run/current-system";
 /// The system profile directory containing generation links.
 const PROFILE_DIR: &str = "/nix/var/nix/profiles";
 
-/// Extract a system summary from the live NixOS system.
+// ---------------------------------------------------------------------------
+// Public extraction entry points
+// ---------------------------------------------------------------------------
+
+/// Extract a summary from the currently running system.
 pub fn extract_live() -> Result<SystemSummary, ExtractError> {
     extract_from_root(Path::new(SYSTEM_ROOT))
 }
 
-/// Extract a system summary from a specific generation number.
+/// Extract a summary from a specific generation number.
 pub fn extract_generation(generation: u64) -> Result<SystemSummary, ExtractError> {
     let link = Path::new(PROFILE_DIR).join(format!("system-{generation}-link"));
     if !link.exists() {
@@ -31,14 +38,61 @@ pub fn extract_generation(generation: u64) -> Result<SystemSummary, ExtractError
     extract_from_root(&link)
 }
 
-/// Extract a system summary from any system root path (current system or generation link).
+/// Extract a summary from any system closure path.
+///
+/// Accepts anything that looks like a NixOS system root: a `./result` symlink
+/// from `nixos-rebuild build`, a generation profile link, or a raw store path.
+pub fn extract_system(path: &Path) -> Result<SystemSummary, ExtractError> {
+    extract_from_root(path)
+}
+
+// ---------------------------------------------------------------------------
+// Generation discovery
+// ---------------------------------------------------------------------------
+
+/// Return the current generation number from the system profile.
+pub fn current_generation() -> Result<u64, ExtractError> {
+    let profile = Path::new(PROFILE_DIR).join("system");
+    let target = fs::read_link(&profile).map_err(|_| ExtractError::NotNixOS)?;
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(ExtractError::NotNixOS)?;
+    parse_generation_number(name).ok_or(ExtractError::NotNixOS)
+}
+
+/// List all available generation numbers, sorted ascending.
+pub fn list_generations() -> Result<Vec<u64>, ExtractError> {
+    let entries = fs::read_dir(PROFILE_DIR).map_err(|_| ExtractError::NotNixOS)?;
+    let mut gens: Vec<u64> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            parse_generation_number(&name)
+        })
+        .collect();
+    gens.sort();
+    Ok(gens)
+}
+
+fn parse_generation_number(name: &str) -> Option<u64> {
+    name.strip_prefix("system-")?
+        .strip_suffix("-link")?
+        .parse()
+        .ok()
+}
+
+// ---------------------------------------------------------------------------
+// Core extraction from a system root
+// ---------------------------------------------------------------------------
+
 fn extract_from_root(root: &Path) -> Result<SystemSummary, ExtractError> {
     if !root.exists() {
         return Err(ExtractError::NotNixOS);
     }
 
-    let unit_dir = resolve_units_dir(root);
-    let etc_dir = resolve_etc_dir(root);
+    let unit_dir = root.join("etc/systemd/system");
+    let etc_dir = root.join("etc");
 
     Ok(SystemSummary {
         machine: extract_machine_info(root, &etc_dir),
@@ -54,17 +108,9 @@ fn extract_from_root(root: &Path) -> Result<SystemSummary, ExtractError> {
     })
 }
 
-/// Resolve the systemd system units directory from the store.
-fn resolve_units_dir(root: &Path) -> std::path::PathBuf {
-    // /run/current-system/etc/systemd/system → /nix/store/xxx-system-units
-    root.join("etc/systemd/system")
-}
-
-/// Resolve the etc directory from the store.
-fn resolve_etc_dir(root: &Path) -> std::path::PathBuf {
-    // /run/current-system/etc → /nix/store/xxx-etc/etc
-    root.join("etc")
-}
+// ---------------------------------------------------------------------------
+// Individual extractors
+// ---------------------------------------------------------------------------
 
 fn extract_machine_info(root: &Path, etc_dir: &Path) -> MachineInfo {
     let hostname = fs::read_to_string(etc_dir.join("hostname"))
@@ -160,8 +206,6 @@ fn extract_timers(unit_dir: &Path) -> Vec<String> {
 /// store, referenced from the activation script.
 fn find_users_groups_json(root: &Path) -> Option<String> {
     let activate = fs::read_to_string(root.join("activate")).ok()?;
-    // The activate script contains a reference like:
-    //   /nix/store/xxx-users-groups.json
     activate
         .split_whitespace()
         .find(|s| s.contains("users-groups.json"))
@@ -202,7 +246,6 @@ fn extract_users(root: &Path) -> BTreeMap<String, UserInfo> {
                 None => continue,
             };
 
-            // Skip nixbld users
             if name.starts_with("nixbld") {
                 continue;
             }
@@ -280,7 +323,6 @@ fn extract_firewall(unit_dir: &Path) -> FirewallInfo {
     let mut tcp_ports = Vec::new();
     let mut udp_ports = Vec::new();
 
-    // Find the firewall-start script path from the unit file
     if let Ok(unit_content) = fs::read_to_string(&fw_unit)
         && let Some(start_script) = extract_exec_start(&unit_content, "firewall-start")
         && let Ok(script) = fs::read_to_string(format!("{start_script}/bin/firewall-start"))
@@ -300,30 +342,24 @@ fn extract_firewall(unit_dir: &Path) -> FirewallInfo {
     }
 }
 
-/// Extract a store path from an ExecStart= line matching a given binary name.
 fn extract_exec_start(unit_content: &str, binary_name: &str) -> Option<String> {
     for line in unit_content.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("ExecStart=") {
-            // Format: @/nix/store/xxx-name/bin/name name
-            // or:      /nix/store/xxx-name/bin/name
             let path = rest.trim_start_matches('@');
-            if path.contains(binary_name) {
-                // Extract the store path (up to /bin/...)
-                if let Some(idx) = path.find("/bin/") {
-                    return Some(path[..idx].to_string());
-                }
+            if path.contains(binary_name)
+                && let Some(idx) = path.find("/bin/")
+            {
+                return Some(path[..idx].to_string());
             }
         }
     }
     None
 }
 
-/// Parse the NixOS-generated firewall script for port rules.
 fn parse_firewall_script(script: &str, tcp_ports: &mut Vec<u16>, udp_ports: &mut Vec<u16>) {
     for line in script.lines() {
         let line = line.trim();
-        // Match lines like: ip46tables -A nixos-fw -p tcp --dport 22 -j nixos-fw-accept
         if !line.contains("nixos-fw-accept") {
             continue;
         }
@@ -348,7 +384,6 @@ fn extract_dport(line: &str) -> Option<u16> {
 }
 
 fn extract_nginx_vhosts(etc_dir: &Path) -> Vec<String> {
-    // NixOS generates nginx config in the store
     let nginx_conf = etc_dir.join("nginx/nginx.conf");
     if let Ok(content) = fs::read_to_string(nginx_conf) {
         let mut vhosts: Vec<String> = content
@@ -394,7 +429,6 @@ fn extract_packages(root: &Path) -> Vec<String> {
         .lines()
         .filter_map(|line| {
             let path = line.strip_prefix("/nix/store/")?;
-            // hash-name-version → name-version
             let (_, name) = path.split_once('-')?;
             Some(name.to_string())
         })
@@ -425,7 +459,6 @@ fn collect_etc_files(dir: &Path, prefix: &str, files: &mut Vec<String>) {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip NixOS metadata files (ownership/permissions)
         if name.ends_with(".gid") || name.ends_with(".uid") || name.ends_with(".mode") {
             continue;
         }
@@ -452,9 +485,6 @@ fn collect_etc_files(dir: &Path, prefix: &str, files: &mut Vec<String>) {
 fn extract_postgresql(unit_dir: &Path) -> PostgresqlInfo {
     let enabled = unit_dir.join("postgresql.service").exists();
 
-    // PostgreSQL databases/users are declared in the ensure scripts,
-    // but extracting them from the store scripts is fragile. For now,
-    // just report whether postgresql is enabled.
     PostgresqlInfo {
         enable: enabled,
         ensure_databases: Vec::new(),

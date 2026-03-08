@@ -1,5 +1,5 @@
 {
-  description = "Compare NixOS systems, locally or peer-to-peer";
+  description = "Preview and review NixOS system changes";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -21,11 +21,10 @@
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "nixdelta";
-          version = "0.1.1";
+          version = "0.2.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
-          # Bundle extract.nix next to the binary
           postInstall = ''
             cp ${./extract.nix} $out/bin/extract.nix
           '';

@@ -1,5 +1,4 @@
 use crate::diff::{ChangeEntry, ChangeSection};
-use crate::extract::SystemSummary;
 use owo_colors::OwoColorize;
 use serde::Serialize;
 
@@ -38,7 +37,6 @@ fn print_section(section: &ChangeSection) {
         }
     }
 
-    // Modified entries always span full width
     for (name, desc) in &modified {
         println!(
             "    {} {}  {}",
@@ -51,7 +49,6 @@ fn print_section(section: &ChangeSection) {
     if !added.is_empty() && !removed.is_empty() {
         print_two_columns(&added, &removed);
     } else {
-        // Single column when only additions or only removals
         for (name, detail) in &added {
             print_single_entry("+", name, *detail, true);
         }
@@ -65,7 +62,6 @@ fn print_section(section: &ChangeSection) {
 
 /// Print added and removed entries side by side.
 fn print_two_columns(added: &[(&str, Option<&str>)], removed: &[(&str, Option<&str>)]) {
-    // Compute right column start position from the widest left entry
     let max_left = added
         .iter()
         .map(|(n, d)| 6 + n.len() + d.map_or(0, |d| 2 + d.len()))
@@ -136,25 +132,10 @@ struct JsonChange {
 }
 
 /// Serialize changes as JSON.
-pub fn json_changes(
-    before: &SystemSummary,
-    after: &SystemSummary,
-    sections: &[ChangeSection],
-) -> String {
-    let before_label = before.machine.label();
-    let after_label = after.machine.label();
-
+pub fn json_changes(before_label: &str, after_label: &str, sections: &[ChangeSection]) -> String {
     let report = JsonReport {
-        before: if before_label.is_empty() {
-            "before"
-        } else {
-            &before_label
-        },
-        after: if after_label.is_empty() {
-            "after"
-        } else {
-            &after_label
-        },
+        before: before_label,
+        after: after_label,
         total_changes: sections.iter().map(|s| s.entries.len()).sum(),
         sections: sections
             .iter()

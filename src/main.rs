@@ -2,20 +2,15 @@ mod diff;
 mod display;
 mod extract;
 mod live;
-mod peer;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process;
 
-/// Compare NixOS systems, locally or peer-to-peer.
+/// Preview and review NixOS system changes.
 ///
-/// Extract system-level artifacts (services, users, ports, packages) from NixOS
-/// configurations and diff them — either between two local flake refs or across
-/// the network with another NixOS user via iroh P2P.
-///
-/// When a flake ref is omitted, nixdelta extracts from the currently running
-/// NixOS system — no source code needed.
+/// Reads system-level declarations directly from the nix store.
+/// No evaluation, no root access.
 #[derive(Parser)]
 #[command(name = "nixdelta", version)]
 struct Cli {
@@ -33,41 +28,40 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Compare two local NixOS configurations.
-    Diff {
-        /// Flake reference for the "before" configuration.
-        before: String,
-        /// Flake reference for the "after" configuration.
-        after: String,
+    /// Preview what a rebuild would change.
+    ///
+    /// Compares the current running system against a target. The target can be
+    /// a path to a built system closure or a flake ref.
+    ///
+    ///   nixos-rebuild build && nixdelta preview
+    ///   nixdelta preview /path/to/result
+    ///   nixdelta preview .#nixosConfigurations.myhost
+    Preview {
+        /// System closure path or flake ref (default: ./result).
+        target: Option<String>,
     },
 
-    /// Share your system over P2P and wait for a peer to compare.
+    /// Show what the last rebuild changed.
     ///
-    /// If no flake ref is given, shares the currently running NixOS system.
-    Share {
-        /// Flake reference (omit to use the running system).
-        flake_ref: Option<String>,
-    },
+    /// Compares the previous generation against the current one.
+    Report,
 
-    /// Compare your system against a peer's shared summary.
+    /// Compare two NixOS generations.
     ///
-    /// If no flake ref is given, compares the currently running NixOS system.
-    Compare {
-        /// Connection ticket from the peer's `share` command.
-        ticket: String,
-        /// Flake reference (omit to use the running system).
-        flake_ref: Option<String>,
-    },
-
-    /// Compare two NixOS generations on this machine.
-    ///
-    /// Shows what changed between system generations (e.g. after nixos-rebuild).
     /// If only one generation is given, compares it against the current system.
     Generations {
         /// First generation number.
         before: u64,
         /// Second generation number (omit to compare against current system).
         after: Option<u64>,
+    },
+
+    /// Compare two flake configurations.
+    Diff {
+        /// Flake reference for the "before" configuration.
+        before: String,
+        /// Flake reference for the "after" configuration.
+        after: String,
     },
 }
 
@@ -89,58 +83,53 @@ fn resolve_extractor(cli_path: &Option<PathBuf>) -> PathBuf {
     process::exit(1);
 }
 
-/// Extract a system summary from either a flake ref or the running system.
-fn get_summary(flake_ref: &Option<String>, extractor: &Option<PathBuf>) -> extract::SystemSummary {
-    match flake_ref {
-        Some(fref) => {
-            let extractor_path = resolve_extractor(extractor);
-            eprintln!("extracting: {fref}");
-            match extract::extract(fref, &extractor_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+/// Check if a string looks like a flake ref (contains #).
+fn is_flake_ref(s: &str) -> bool {
+    s.contains('#')
+}
+
+/// Build a flake ref's toplevel system closure and return the store path.
+fn build_flake(flake_ref: &str) -> PathBuf {
+    // nixosConfigurations.foo -> nixosConfigurations.foo.config.system.build.toplevel
+    let toplevel = format!("{flake_ref}.config.system.build.toplevel");
+    eprintln!("building: {flake_ref}");
+    let output = match std::process::Command::new("nix")
+        .args(["build", "--no-link", "--print-out-paths", &toplevel])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error: failed to run nix build: {e}");
+            process::exit(1);
         }
-        None => {
-            eprintln!("extracting from running system...");
-            match live::extract_live() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
-        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("error: nix build failed:\n{stderr}");
+        process::exit(1);
     }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    PathBuf::from(path)
 }
 
 fn show_diff(
     before: &extract::SystemSummary,
     after: &extract::SystemSummary,
-    changes: &[diff::ChangeSection],
+    before_label: &str,
+    after_label: &str,
     json: bool,
 ) {
+    let changes = diff::diff(before, after);
+
     if json {
-        let output = display::json_changes(before, after, changes);
+        let output = display::json_changes(before_label, after_label, &changes);
         println!("{output}");
     } else if changes.is_empty() {
-        eprintln!("no changes detected");
+        eprintln!("no changes");
     } else {
-        let before_label = before.machine.label();
-        let after_label = after.machine.label();
-        let before_label = if before_label.is_empty() {
-            "before".into()
-        } else {
-            before_label
-        };
-        let after_label = if after_label.is_empty() {
-            "after".into()
-        } else {
-            after_label
-        };
-        display::print_changes(&before_label, &after_label, changes);
+        display::print_changes(before_label, after_label, &changes);
     }
 }
 
@@ -148,31 +137,110 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Diff { before, after } => {
-            let before_summary = get_summary(&Some(before.clone()), &cli.extractor);
-            let after_summary = get_summary(&Some(after.clone()), &cli.extractor);
-            let changes = diff::diff(&before_summary, &after_summary);
-            show_diff(&before_summary, &after_summary, &changes, cli.json);
-        }
+        Command::Preview { target } => {
+            let target_str = target.unwrap_or_else(|| "./result".into());
 
-        Command::Share { flake_ref } => {
-            let summary = get_summary(&flake_ref, &cli.extractor);
-            let json = serde_json::to_vec(&summary).expect("failed to serialize summary");
+            let target_path = if is_flake_ref(&target_str) {
+                build_flake(&target_str)
+            } else {
+                let p = PathBuf::from(&target_str);
+                if !p.exists() {
+                    eprintln!("error: {target_str} not found");
+                    eprintln!();
+                    eprintln!("  build first:  nixos-rebuild build");
+                    eprintln!("  or specify:   nixdelta preview /path/to/result");
+                    eprintln!("  or a flake:   nixdelta preview .#nixosConfigurations.myhost");
+                    process::exit(1);
+                }
+                p
+            };
 
-            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-            let peer_json = match rt.block_on(peer::share(json)) {
-                Ok(j) => j,
+            let current = match live::extract_live() {
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
             };
 
-            let peer_summary: extract::SystemSummary =
-                serde_json::from_slice(&peer_json).expect("failed to parse peer summary");
+            let pending = match live::extract_system(&target_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
 
-            let changes = diff::diff(&summary, &peer_summary);
-            show_diff(&summary, &peer_summary, &changes, cli.json);
+            let current_label = current.machine.label();
+            let pending_label = pending.machine.label();
+            show_diff(
+                &current,
+                &pending,
+                &if current_label.is_empty() {
+                    "current".into()
+                } else {
+                    current_label
+                },
+                &if pending_label.is_empty() {
+                    "pending".into()
+                } else {
+                    format!("{pending_label} (pending)")
+                },
+                cli.json,
+            );
+        }
+
+        Command::Report => {
+            let current_gen = match live::current_generation() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
+
+            let generations = match live::list_generations() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
+
+            let previous_gen = generations
+                .iter()
+                .rev()
+                .find(|&&g| g < current_gen)
+                .copied();
+
+            let Some(previous_gen) = previous_gen else {
+                eprintln!("no previous generation to compare against");
+                process::exit(0);
+            };
+
+            let before = match live::extract_generation(previous_gen) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
+
+            let after = match live::extract_generation(current_gen) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
+
+            show_diff(
+                &before,
+                &after,
+                &format!("gen {previous_gen}"),
+                &format!("gen {current_gen} (current)"),
+                cli.json,
+            );
         }
 
         Command::Generations { before, after } => {
@@ -201,32 +269,56 @@ fn main() {
                 },
             };
 
-            let before_label = format!("gen {before}");
-            let after_label = after.map_or("current".into(), |g| format!("gen {g}"));
-            eprintln!("{before_label} → {after_label}");
-
-            let changes = diff::diff(&before_summary, &after_summary);
-            show_diff(&before_summary, &after_summary, &changes, cli.json);
+            show_diff(
+                &before_summary,
+                &after_summary,
+                &format!("gen {before}"),
+                &after.map_or("current".into(), |g| format!("gen {g}")),
+                cli.json,
+            );
         }
 
-        Command::Compare { ticket, flake_ref } => {
-            let my_summary = get_summary(&flake_ref, &cli.extractor);
-            let my_json = serde_json::to_vec(&my_summary).expect("failed to serialize summary");
+        Command::Diff {
+            before: before_ref,
+            after: after_ref,
+        } => {
+            let extractor_path = resolve_extractor(&cli.extractor);
 
-            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-            let peer_json = match rt.block_on(peer::compare(my_json, &ticket)) {
-                Ok(j) => j,
+            eprintln!("evaluating: {before_ref}");
+            let before = match extract::extract(&before_ref, &extractor_path) {
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
             };
 
-            let peer_summary: extract::SystemSummary =
-                serde_json::from_slice(&peer_json).expect("failed to parse peer summary");
+            eprintln!("evaluating: {after_ref}");
+            let after = match extract::extract(&after_ref, &extractor_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
 
-            let changes = diff::diff(&peer_summary, &my_summary);
-            show_diff(&peer_summary, &my_summary, &changes, cli.json);
+            let before_label = before.machine.label();
+            let after_label = after.machine.label();
+            show_diff(
+                &before,
+                &after,
+                &if before_label.is_empty() {
+                    before_ref
+                } else {
+                    before_label
+                },
+                &if after_label.is_empty() {
+                    after_ref
+                } else {
+                    after_label
+                },
+                cli.json,
+            );
         }
     }
 }
